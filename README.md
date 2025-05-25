@@ -198,6 +198,8 @@ pancakeswap-integration/
 ├── test.js                        # 测试文件
 ├── package.json                   # 项目配置
 ├── env.example                    # 环境变量示例
+├── LICENSE                        # MIT开源协议
+├── TASK_EVALUATION.md             # 任务评估表
 └── README.md                      # 项目文档
 ```
 
