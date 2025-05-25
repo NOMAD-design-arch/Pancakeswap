@@ -1,0 +1,31 @@
+{
+  "name": "pancakeswap-integration",
+  "version": "1.0.0",
+  "description": "PancakeSwap集成工具 - 滑点估算、价格影响计算和流动性池监控",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test.js",
+    "example": "node examples/example.js",
+    "advanced": "node examples/advanced-example.js",
+    "demo": "npm run advanced"
+  },
+  "dependencies": {
+    "ethers": "^6.9.0",
+    "bignumber.js": "^9.1.2",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "pancakeswap",
+    "defi",
+    "bsc",
+    "slippage",
+    "price-impact"
+  ],
+  "author": "",
+  "license": "MIT"
+} 
