@@ -100,13 +100,25 @@ async function handleSlippageCalculation(pancakeswap) {
   showPopularTokens();
   
   const tokenAddress = await askQuestion('请输入代币地址: ');
-  const amount = await askQuestion('请输入卖出数量 (不包含小数位): ');
+  const amountInput = await askQuestion('请输入卖出数量 (不包含小数位): ');
+  
+  const amount = parseFloat(amountInput);
+  if (isNaN(amount) || amount <= 0) {
+    console.error('❌ 无效的数量，请输入正数');
+    return;
+  }
   
   console.log('⏳ 计算中...');
   
   try {
     const tokenInfo = await pancakeswap.getTokenInfo(tokenAddress);
-    const adjustedAmount = (parseInt(amount) * Math.pow(10, tokenInfo.decimals)).toString();
+    
+    const { BigNumber } = require('bignumber.js');
+    const adjustedAmount = new BigNumber(amount)
+      .multipliedBy(Math.pow(10, tokenInfo.decimals))
+      .integerValue()
+      .toString();
+      
     const slippageData = await pancakeswap.calculateSlippage(tokenAddress, adjustedAmount);
     
     console.log('\n✅ 滑点计算结果:');
@@ -130,7 +142,15 @@ async function handlePriceImpactCalculation(pancakeswap) {
   
   try {
     const marketCapInfo = await pancakeswap.getMarketCapInfo(tokenAddress);
-    const adjustedTotalSupply = parseInt(marketCapInfo.tokenInfo.totalSupply) / Math.pow(10, marketCapInfo.tokenInfo.decimals);
+    console.log('🔍 调试信息:');
+    console.log(`原始总供应量: ${marketCapInfo.tokenInfo.totalSupply}`);
+    console.log(`小数位: ${marketCapInfo.tokenInfo.decimals}`);
+    console.log(`当前价格: ${marketCapInfo.price}`);
+    
+    const { BigNumber } = require('bignumber.js');
+    const adjustedTotalSupply = new BigNumber(marketCapInfo.tokenInfo.totalSupply)
+      .dividedBy(Math.pow(10, marketCapInfo.tokenInfo.decimals));
+    console.log(`调整后的总供应量: ${adjustedTotalSupply.toString()}`);
     
     const priceImpacts = await pancakeswap.calculatePriceImpact(
       tokenAddress,
@@ -148,6 +168,10 @@ async function handlePriceImpactCalculation(pancakeswap) {
       console.log(`卖出数量: ${parseFloat(impact.sellAmount).toFixed(2)} ${marketCapInfo.tokenInfo.symbol}`);
       console.log(`卖出价值: ${parseFloat(impact.sellValueWBNB).toFixed(6)} WBNB`);
       console.log(`价格影响: ${impact.priceImpact}%`);
+      if (impact.debug) {
+        console.log(`🔍 调试: 卖出数量Wei: ${impact.sellAmountWei}`);
+        console.log(`🔍 调试: 储备量比率: ${impact.debug.amountInPercentage}%`);
+      }
     });
   } catch (error) {
     console.error('❌ 价格影响计算失败:', error.message);
@@ -166,9 +190,17 @@ async function handleLiquidityMonitoring(pancakeswap) {
     return;
   }
   
-  const duration = await askQuestion('监控时长 (秒, 默认30): ') || '30';
+  const duration = parseInt(await askQuestion('监控时长 (秒, 默认30): ') || '30');
+  
+  // 🔧 Bug修复: 确保监控时长合理
+  if (duration < 10) {
+    console.error('❌ 监控时长至少需要10秒');
+    return;
+  }
   
   console.log('⏳ 正在检查代币和流动性池...');
+  
+  let monitorInterval = null;
   
   try {
     // 先获取代币信息
@@ -191,9 +223,10 @@ async function handleLiquidityMonitoring(pancakeswap) {
     console.log(`⏰ 监控时长: ${duration}秒\n`);
     
     let monitorCount = 0;
-    const maxMonitorings = Math.floor(parseInt(duration) / 5); // 每5秒检查一次
+    // 🔧 Bug修复: 确保最小监控次数
+    const maxMonitorings = Math.max(Math.floor(duration / 5), 2); // 每5秒检查一次，至少2次
     
-    const monitorInterval = setInterval(async () => {
+    monitorInterval = setInterval(async () => {
       try {
         monitorCount++;
         const changeData = await pancakeswap.monitorLiquidityPool(tokenAddress);
@@ -217,18 +250,38 @@ async function handleLiquidityMonitoring(pancakeswap) {
           console.log(`⏱️  剩余检查次数: ${remainingChecks}`);
         }
         
+        // 🔧 Bug修复: 检查是否应该停止监控
+        if (monitorCount >= maxMonitorings) {
+          clearInterval(monitorInterval);
+          console.log('\n🎉 监控完成！');
+          console.log('💾 监控数据已保存，可以重新开始监控以查看变化。');
+        }
+        
       } catch (error) {
         console.error(`❌ ${new Date().toLocaleTimeString()} - 监控错误:`, error.message);
+        // 🔧 Bug修复: 监控错误时也要更新计数，避免无限循环
+        if (monitorCount >= maxMonitorings) {
+          clearInterval(monitorInterval);
+          console.log('\n⚠️ 监控因错误结束');
+        }
       }
     }, 5000); // 每5秒检查一次
     
+    // 🔧 Bug修复: 使用精确的时间控制
     setTimeout(() => {
-      clearInterval(monitorInterval);
-      console.log('\n🎉 监控完成！');
-      console.log('💾 监控数据已保存，可以重新开始监控以查看变化。');
-    }, parseInt(duration) * 1000);
+      if (monitorInterval) {
+        clearInterval(monitorInterval);
+        console.log('\n🎉 监控时间到期，监控完成！');
+        console.log('💾 监控数据已保存，可以重新开始监控以查看变化。');
+      }
+    }, duration * 1000);
     
   } catch (error) {
+    // 🔧 Bug修复: 确保清理资源
+    if (monitorInterval) {
+      clearInterval(monitorInterval);
+    }
+    
     console.error('❌ 监控设置失败:');
     console.error('📝 错误详情:', error.message);
     
@@ -255,18 +308,41 @@ async function handleTokenInfo(pancakeswap) {
   console.log('⏳ 获取信息...');
   
   try {
-    const [tokenInfo, marketCapInfo] = await Promise.all([
-      pancakeswap.getTokenInfo(tokenAddress),
-      pancakeswap.getMarketCapInfo(tokenAddress)
-    ]);
+    // 🔧 Bug修复: 分别处理请求，避免一个失败影响全部
+    let tokenInfo, marketCapInfo;
+    
+    try {
+      tokenInfo = await pancakeswap.getTokenInfo(tokenAddress);
+      console.log('✅ 代币基础信息获取成功');
+    } catch (error) {
+      console.error('❌ 获取代币基础信息失败:', error.message);
+      return;
+    }
+    
+    try {
+      marketCapInfo = await pancakeswap.getMarketCapInfo(tokenAddress);
+      console.log('✅ 市值信息获取成功');
+    } catch (error) {
+      console.error('❌ 获取市值信息失败:', error.message);
+      console.log('💡 将仅显示基础代币信息');
+      marketCapInfo = null;
+    }
     
     console.log('\n✅ 代币信息:');
     console.log(`名称: ${tokenInfo.name}`);
     console.log(`符号: ${tokenInfo.symbol}`);
     console.log(`小数位: ${tokenInfo.decimals}`);
-    console.log(`总供应量: ${(parseInt(tokenInfo.totalSupply) / Math.pow(10, tokenInfo.decimals)).toLocaleString()}`);
-    console.log(`当前价格: ${parseFloat(marketCapInfo.price).toFixed(8)} WBNB`);
-    console.log(`市值: ${parseFloat(marketCapInfo.marketCap).toFixed(2)} WBNB`);
+    
+    // 🔧 Bug修复: 使用BigNumber处理大数
+    const { BigNumber } = require('bignumber.js');
+    const totalSupply = new BigNumber(tokenInfo.totalSupply)
+      .dividedBy(Math.pow(10, tokenInfo.decimals));
+    console.log(`总供应量: ${totalSupply.toFormat()}`);
+    
+    if (marketCapInfo) {
+      console.log(`当前价格: ${parseFloat(marketCapInfo.price).toFixed(8)} WBNB`);
+      console.log(`市值: ${parseFloat(marketCapInfo.marketCap).toFixed(2)} WBNB`);
+    }
     
   } catch (error) {
     console.error('❌ 获取代币信息失败:', error.message);
@@ -354,7 +430,38 @@ async function handleBatchSlippageAnalysis(pancakeswap) {
       break;
     case '4':
       const customAmounts = await askQuestion('请输入数量 (用逗号分隔): ');
-      amounts = customAmounts.split(',').map(a => parseFloat(a.trim())).filter(a => !isNaN(a));
+      // 🔧 Bug修复: 加强输入验证
+      try {
+        amounts = customAmounts.split(',')
+          .map(a => {
+            const num = parseFloat(a.trim());
+            if (isNaN(num) || num <= 0) {
+              throw new Error(`无效数量: ${a.trim()}`);
+            }
+            if (num > 1e15) {
+              throw new Error(`数量过大: ${a.trim()}`);
+            }
+            return num;
+          })
+          .filter(a => a > 0);
+        
+        if (amounts.length === 0) {
+          throw new Error('没有有效的数量');
+        }
+        
+        if (amounts.length > 20) {
+          console.log('⚠️ 数量过多，将限制为前20个');
+          amounts = amounts.slice(0, 20);
+        }
+        
+        // 按数量排序，便于分析
+        amounts.sort((a, b) => a - b);
+        
+      } catch (error) {
+        console.error('❌ 自定义数量格式错误:', error.message);
+        console.log('💡 格式示例: 100, 500, 1000');
+        return;
+      }
       break;
     default:
       console.log('❌ 无效选择，使用默认小额交易模式');
@@ -366,6 +473,7 @@ async function handleBatchSlippageAnalysis(pancakeswap) {
     return;
   }
   
+  console.log(`\n📋 将分析 ${amounts.length} 个数量: ${amounts.join(', ')}`);
   console.log('\n⏳ 开始批量滑点分析...');
   
   try {
@@ -440,7 +548,53 @@ async function handleAdvancedPriceImpactAnalysis(pancakeswap) {
       break;
     case '3':
       const customPercentages = await askQuestion('请输入百分比 (用逗号分隔): ');
-      percentages = customPercentages.split(',').map(p => parseFloat(p.trim())).filter(p => !isNaN(p));
+      // 🔧 Bug修复: 添加数值范围验证
+      try {
+        percentages = customPercentages.split(',')
+          .map(p => {
+            const num = parseFloat(p.trim());
+            if (isNaN(num)) {
+              throw new Error(`无效百分比: ${p.trim()}`);
+            }
+            if (num <= 0) {
+              throw new Error(`百分比必须大于0: ${p.trim()}`);
+            }
+            if (num > 100) {
+              throw new Error(`百分比不能超过100%: ${p.trim()}`);
+            }
+            return num;
+          })
+          .filter(p => p > 0);
+        
+        if (percentages.length === 0) {
+          throw new Error('没有有效的百分比');
+        }
+        
+        if (percentages.length > 15) {
+          console.log('⚠️ 百分比过多，将限制为前15个');
+          percentages = percentages.slice(0, 15);
+        }
+        
+        // 按百分比排序
+        percentages.sort((a, b) => a - b);
+        
+        // 检查是否有过大的百分比
+        const largePercentages = percentages.filter(p => p > 50);
+        if (largePercentages.length > 0) {
+          console.log(`⚠️ 警告: 以下百分比可能导致极大价格影响: ${largePercentages.join(', ')}%`);
+          const confirm = await askQuestion('是否继续? (y/n): ');
+          if (confirm.toLowerCase() !== 'y' && confirm.toLowerCase() !== 'yes') {
+            console.log('❌ 分析已取消');
+            return;
+          }
+        }
+        
+      } catch (error) {
+        console.error('❌ 自定义百分比格式错误:', error.message);
+        console.log('💡 格式示例: 0.1, 0.5, 1, 2, 5');
+        console.log('💡 百分比范围: 0-100');
+        return;
+      }
       break;
     default:
       console.log('❌ 无效选择，使用标准分析');
@@ -452,6 +606,7 @@ async function handleAdvancedPriceImpactAnalysis(pancakeswap) {
     return;
   }
   
+  console.log(`\n📋 将分析市值百分比: ${percentages.join(', ')}%`);
   console.log('\n⏳ 开始高级价格影响分析...');
   
   try {

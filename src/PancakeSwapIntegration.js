@@ -217,9 +217,42 @@ class PancakeSwapIntegration {
   }
 
   /**
+   * 用户友好的滑点计算方法
+   * @param {string} tokenAddress - 代币地址
+   * @param {number} userAmount - 用户友好的数量（如1.5个代币）
+   * @param {string} baseToken - 基础代币地址 (默认WBNB)
+   */
+  async calculateSlippageUserFriendly(tokenAddress, userAmount, baseToken = config.WBNB_ADDRESS) {
+    try {
+      // 获取代币信息
+      const tokenInfo = await this.getTokenInfo(tokenAddress);
+      
+      // 转换为wei格式
+      const amountWei = new BigNumber(userAmount)
+        .multipliedBy(Math.pow(10, tokenInfo.decimals))
+        .integerValue()
+        .toString();
+      
+      // 调用原始滑点计算方法
+      const result = await this.calculateSlippage(tokenAddress, amountWei, baseToken);
+      
+      // 添加用户友好的显示格式
+      return {
+        ...result,
+        userAmount: userAmount,
+        userAmountFormatted: `${userAmount} ${tokenInfo.symbol}`,
+        tokenInfo: tokenInfo
+      };
+    } catch (error) {
+      console.error(`用户友好滑点计算失败: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
    * 模拟卖出操作计算滑点
    * @param {string} tokenAddress - 代币地址
-   * @param {string} amountIn - 卖出数量
+   * @param {string} amountIn - 卖出数量 (wei格式)
    * @param {string} baseToken - 基础代币地址 (默认WBNB)
    */
   async calculateSlippage(tokenAddress, amountIn, baseToken = config.WBNB_ADDRESS) {
@@ -235,38 +268,116 @@ class PancakeSwapIntegration {
         }
       }
 
+      // 获取代币信息用于decimal处理
+      const [tokenInfo, baseTokenInfo] = await Promise.all([
+        this.getTokenInfo(tokenAddress),
+        this.getTokenInfo(baseToken)
+      ]);
+
+      // 确保amountIn是wei格式的字符串
+      const amountInBN = new BigNumber(amountIn);
+      if (amountInBN.isNaN() || amountInBN.lte(0)) {
+        throw new Error('输入数量必须大于0');
+      }
+
       // 获取当前储备量
       const reserves = await this.getPairReserves(tokenAddress, baseToken);
-      const reserveIn = new BigNumber(reserves.reserveA);
-      const reserveOut = new BigNumber(reserves.reserveB);
+      const reserveIn = new BigNumber(reserves.reserveA);  // tokenAddress的储备量
+      const reserveOut = new BigNumber(reserves.reserveB); // baseToken的储备量
       
-      // 计算理论价格（无滑点）
-      const theoreticalPrice = reserveOut.dividedBy(reserveIn);
+      // 检查储备量是否充足
+      if (reserveIn.lte(0) || reserveOut.lte(0)) {
+        throw new Error('流动性池储备量不足');
+      }
+
+      // 检查卖出数量是否超过储备量的合理比例（比如50%）
+      if (amountInBN.gte(reserveIn.multipliedBy(0.5))) {
+        console.warn('⚠️ 卖出数量过大，可能导致极高滑点');
+      }
+
+      // 🔹 Uniswap V2/PancakeSwap AMM 公式实现
       
-      // 使用PancakeSwap公式计算实际输出（包含0.25%手续费）
-      const amountInBN = new BigNumber(amountIn);
-      const amountInWithFee = amountInBN.multipliedBy(997); // 99.75%
+      // 1. 计算交易前的汇率（不含手续费）
+      const preTradingRate = reserveOut.dividedBy(reserveIn);
+      
+      // 2. 使用标准AMM公式计算实际输出（含0.25%手续费）
+      // 🔧 Bug修复: PancakeSwap v2手续费是0.25%，不是0.3%
+      // 公式: amountOut = (amountIn * 9975 * reserveOut) / (reserveIn * 10000 + amountIn * 9975)
+      const amountInWithFee = amountInBN.multipliedBy(9975); // 扣除0.25%手续费
       const numerator = amountInWithFee.multipliedBy(reserveOut);
-      const denominator = reserveIn.multipliedBy(1000).plus(amountInWithFee);
+      const denominator = reserveIn.multipliedBy(10000).plus(amountInWithFee);
+      
+      // 防止除零错误
+      if (denominator.lte(0)) {
+        throw new Error('计算错误：分母为零或负数');
+      }
+      
       const actualAmountOut = numerator.dividedBy(denominator);
       
-      // 计算实际价格
-      const actualPrice = actualAmountOut.dividedBy(amountInBN);
+      // 3. 计算交易后的有效汇率
+      const effectiveRate = actualAmountOut.dividedBy(amountInBN);
       
-      // 计算滑点百分比
-      const slippage = theoreticalPrice.minus(actualPrice)
-        .dividedBy(theoreticalPrice)
+      // 4. 计算无滑点情况下的理论输出（仅扣除手续费）
+      // 🔧 Bug修复: 使用正确的0.25%手续费
+      // 理论输出 = amountIn * preTradingRate * (1 - 0.0025)
+      const theoreticalAmountOut = amountInBN.multipliedBy(preTradingRate).multipliedBy(0.9975);
+      
+      // 5. 计算价格影响（滑点） - 这是AMM机制导致的额外损失
+      // 价格影响 = (理论输出 - 实际输出) / 理论输出 * 100%
+      let priceImpact = new BigNumber(0);
+      if (theoreticalAmountOut.gt(0)) {
+        priceImpact = theoreticalAmountOut.minus(actualAmountOut)
+          .dividedBy(theoreticalAmountOut)
+          .multipliedBy(100);
+      }
+      
+      // 确保价格影响为正数（负数意味着计算错误）
+      const finalPriceImpact = priceImpact.lt(0) ? new BigNumber(0) : priceImpact;
+      
+      // 6. 计算交易后新的储备量（用于验证）
+      const newReserveIn = reserveIn.plus(amountInBN);
+      const newReserveOut = reserveOut.minus(actualAmountOut);
+      const postTradingRate = newReserveOut.dividedBy(newReserveIn);
+      
+      // 7. 计算汇率变化百分比
+      const rateChange = preTradingRate.minus(postTradingRate)
+        .dividedBy(preTradingRate)
         .multipliedBy(100);
+
+      // 8. AMM 验证 - k值应该因为手续费而增加
+      const kBefore = reserveIn.multipliedBy(reserveOut);
+      const kAfter = newReserveIn.multipliedBy(newReserveOut);
+      const kIncrease = kAfter.minus(kBefore).dividedBy(kBefore).multipliedBy(100);
 
       return {
         amountIn: amountIn,
-        theoreticalAmountOut: amountInBN.multipliedBy(theoreticalPrice).toFixed(),
+        theoreticalAmountOut: theoreticalAmountOut.toFixed(),
         actualAmountOut: actualAmountOut.toFixed(),
-        theoreticalPrice: theoreticalPrice.toFixed(),
-        actualPrice: actualPrice.toFixed(),
-        slippagePercentage: slippage.toFixed(4),
-        priceImpact: slippage.toFixed(4),
-        baseToken: baseToken
+        preTradingRate: preTradingRate.toFixed(),
+        effectiveRate: effectiveRate.toFixed(),
+        postTradingRate: postTradingRate.toFixed(),
+        slippagePercentage: finalPriceImpact.toFixed(4),
+        priceImpact: finalPriceImpact.toFixed(4),
+        rateChangePercentage: rateChange.toFixed(4),
+        baseToken: baseToken,
+        // 🔹 数学验证信息
+        debug: {
+          reserveIn: reserveIn.toFixed(),
+          reserveOut: reserveOut.toFixed(),
+          newReserveIn: newReserveIn.toFixed(),
+          newReserveOut: newReserveOut.toFixed(),
+          amountInPercentage: amountInBN.dividedBy(reserveIn).multipliedBy(100).toFixed(4),
+          tokenSymbol: tokenInfo.symbol,
+          baseTokenSymbol: baseTokenInfo.symbol,
+          // AMM 数学验证
+          kBefore: kBefore.toFixed(),
+          kAfter: kAfter.toFixed(),
+          kIncreasePercentage: kIncrease.toFixed(8),
+          // 🔧 Bug修复: k值应该因为0.25%手续费而增加
+          kValidation: kAfter.gte(kBefore) ? '✅ k值正确增加 (0.25%手续费)' : '❌ k值异常',
+          // 验证AMM公式：(reserveIn + amountIn) * (reserveOut - amountOut) >= reserveIn * reserveOut
+          ammFormulaCheck: kAfter.gte(kBefore) ? '✅ AMM公式正确 (PancakeSwap v2: 0.25%费率)' : '❌ AMM公式错误'
+        }
       };
     } catch (error) {
       console.error(`计算滑点失败: ${error.message}`);
@@ -277,32 +388,79 @@ class PancakeSwapIntegration {
   /**
    * 计算不同市值百分比的价格影响
    * @param {string} tokenAddress - 代币地址
-   * @param {string} totalSupply - 代币总供应量
-   * @param {number} currentPrice - 当前价格 (以WBNB为单位)
+   * @param {string} totalSupply - 代币总供应量 (已调整为可读格式，不包含decimals)
+   * @param {number} currentPrice - 当前价格 (以baseToken为单位)
+   * @param {string} baseToken - 基础代币地址 (默认WBNB)
    */
-  async calculatePriceImpact(tokenAddress, totalSupply, currentPrice) {
+  async calculatePriceImpact(tokenAddress, totalSupply, currentPrice, baseToken = config.WBNB_ADDRESS) {
     try {
       const results = [];
       
+      // 获取代币信息
+      const tokenInfo = await this.getTokenInfo(tokenAddress);
+      
+      console.log(`🔍 价格影响计算参数:`);
+      console.log(`   代币: ${tokenInfo.symbol}`);
+      console.log(`   调整后总供应量: ${totalSupply}`);
+      console.log(`   当前价格: ${currentPrice}`);
+      
       for (const percentage of config.MARKET_CAP_PERCENTAGES) {
-        // 计算要卖出的代币数量（市值的x%）
-        const marketCap = new BigNumber(totalSupply).multipliedBy(currentPrice);
-        const sellValue = marketCap.multipliedBy(percentage).dividedBy(100);
-        const sellAmount = sellValue.dividedBy(currentPrice);
-        
-        // 计算这个数量的滑点
-        const slippageData = await this.calculateSlippage(
-          tokenAddress, 
-          sellAmount.integerValue().toString()
-        );
-        
-        results.push({
-          marketCapPercentage: percentage,
-          sellAmount: sellAmount.toFixed(),
-          sellValueWBNB: sellValue.toFixed(),
-          priceImpact: slippageData.slippagePercentage,
-          actualAmountOut: slippageData.actualAmountOut
-        });
+        try {
+          // 计算要卖出的代币数量（市值的x%）
+          // totalSupply已经是可读格式，不需要再次调整
+          const totalSupplyBN = new BigNumber(totalSupply);
+          const marketCap = totalSupplyBN.multipliedBy(currentPrice);
+          const sellValue = marketCap.multipliedBy(percentage).dividedBy(100);
+          const sellAmountAdjusted = sellValue.dividedBy(currentPrice);
+          
+          console.log(`🔍 ${percentage}% 市值计算:`);
+          console.log(`   市值: ${marketCap.toFixed(6)}`);
+          console.log(`   卖出价值: ${sellValue.toFixed(6)}`);
+          console.log(`   卖出数量: ${sellAmountAdjusted.toFixed(6)}`);
+          
+          // 转换为wei格式
+          const sellAmountWei = sellAmountAdjusted.multipliedBy(Math.pow(10, tokenInfo.decimals));
+          
+          console.log(`   卖出数量Wei: ${sellAmountWei.toFixed()}`);
+          
+          // 检查卖出数量是否太小
+          if (sellAmountWei.lt(1)) {
+            console.log(`   ⚠️ 卖出数量太小，跳过此百分比`);
+            results.push({
+              marketCapPercentage: percentage,
+              sellAmount: "0.00",
+              sellAmountWei: "0",
+              sellValueWBNB: "0.000000",
+              priceImpact: "0.0000",
+              actualAmountOut: "0",
+              error: "卖出数量太小"
+            });
+            continue;
+          }
+          
+          // 计算这个数量的滑点
+          const slippageData = await this.calculateSlippage(
+            tokenAddress, 
+            sellAmountWei.integerValue().toString(),
+            baseToken
+          );
+          
+          results.push({
+            marketCapPercentage: percentage,
+            sellAmount: sellAmountAdjusted.toFixed(2),
+            sellAmountWei: sellAmountWei.toFixed(),
+            sellValueWBNB: sellValue.toFixed(6),
+            priceImpact: slippageData.slippagePercentage,
+            actualAmountOut: slippageData.actualAmountOut,
+            debug: slippageData.debug
+          });
+        } catch (error) {
+          console.log(`  ❌ ${percentage}% 市值计算失败: ${error.message}`);
+          results.push({
+            marketCapPercentage: percentage,
+            error: error.message
+          });
+        }
       }
       
       return results;
@@ -636,10 +794,13 @@ class PancakeSwapIntegration {
           const sellValue = marketCap.multipliedBy(percentage).dividedBy(100);
           const sellAmount = sellValue.dividedBy(marketCapInfo.price);
           
+          // 转换为wei格式
+          const sellAmountWei = sellAmount.multipliedBy(Math.pow(10, marketCapInfo.tokenInfo.decimals));
+          
           // 计算这个数量的滑点
           const slippageData = await this.calculateSlippage(
             tokenAddress, 
-            sellAmount.integerValue().toString()
+            sellAmountWei.integerValue().toString()
           );
           
           // 计算风险等级
@@ -648,11 +809,13 @@ class PancakeSwapIntegration {
           results.push({
             marketCapPercentage: percentage,
             sellAmount: sellAmount.toFixed(2),
+            sellAmountWei: sellAmountWei.toFixed(),
             sellValueWBNB: sellValue.toFixed(6),
             priceImpact: parseFloat(slippageData.slippagePercentage),
             actualAmountOut: slippageData.actualAmountOut,
             riskLevel: riskLevel,
-            recommendation: this.getPriceImpactRecommendation(percentage, parseFloat(slippageData.slippagePercentage))
+            recommendation: this.getPriceImpactRecommendation(percentage, parseFloat(slippageData.slippagePercentage)),
+            debug: slippageData.debug
           });
           
           console.log(`  ✅ ${percentage}% 市值: ${slippageData.slippagePercentage}% 影响 (${riskLevel})`);
